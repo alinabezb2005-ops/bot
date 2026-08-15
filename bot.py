@@ -929,7 +929,7 @@ ADMIN_REPLY_KB = ReplyKeyboardMarkup([
     ["📅 Сегодня",        "📆 Неделя"],
     ["➕ Добавить занятие", "✅ Провёл занятие"],
     ["📚 Напомнить о ДЗ", "👥 Ученики"],
-], resize_keyboard=True, persistent=True)
+], resize_keyboard=True)
 
 async def send_admin_main_menu(bot, text="Выбери действие:"):
     """Отправляет сообщение с постоянной клавиатурой репетитору"""
