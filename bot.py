@@ -121,20 +121,13 @@ def fmt_date(iso):
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid == ADMIN_ID:
-        kb = [
-            [InlineKeyboardButton("📅 Сегодня", callback_data="show_today"),
-             InlineKeyboardButton("📆 Неделя", callback_data="show_week")],
-            [InlineKeyboardButton("➕ Добавить занятие", callback_data="cb_addlesson"),
-             InlineKeyboardButton("👥 Ученики", callback_data="cb_students")],
-        ]
         await update.message.reply_text(
             "👋 Привет, Илья!\n\n"
-            "Я твой бот-расписание — буду напоминать о занятиях "
-            "и держать всё под рукой.\n\n"
-            "Каждое утро в 9:00 пришлю сводку на день. "
-            "За 4 часа и за 15 минут до урока — напомню тебе и ученику.\n\n"
-            "Что делаем?",
-            reply_markup=InlineKeyboardMarkup(kb))
+            "Я твой бот-расписание.\n"
+            "Каждое утро в 9:00 — сводка на день.\n"
+            "За 4 часа — напомню ученику, за 15 минут — нам обоим.\n\n"
+            "Используй кнопки внизу 👇",
+            reply_markup=ADMIN_REPLY_KB)
         return
 
     name = get_student_name(uid)
@@ -378,6 +371,29 @@ async def got_lesson_recurring(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = [[InlineKeyboardButton("➕ Ещё занятие", callback_data="cb_addlesson"),
            InlineKeyboardButton("📅 Сегодня", callback_data="show_today")]]
     await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    # Уведомляем ученика о новых занятиях
+    students_data = get_students()
+    st = students_data.get(lesson_data["student"], {})
+    if st.get("tg_id"):
+        fname = lesson_data["student"].split()[0]
+        s_dates = "\n".join(
+            f"📅 {fmt_date(l['date'])} · 🕐 {l['time']}"
+            for l in added[:5])
+        if len(added) > 5:
+            s_dates += f"\n...и ещё {len(added)-5} занятий"
+        try:
+            await q.get_bot().send_message(st["tg_id"],
+                f"Привет, {fname}! 👋\n\n"
+                f"Репетитор Илья назначил тебе занятия:\n\n"
+                f"{s_dates}\n\n"
+                f"Я буду напоминать тебе о каждом уроке заранее 🔔\n"
+                f"Все материалы и задания — на платформе:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🖥 Открыть платформу", url=PLATFORM_URL),
+                    InlineKeyboardButton("📱 Написать репетитору",
+                        url=f"https://t.me/{TUTOR_TG.lstrip('@')}")
+                ]]))
+        except: pass
     return ConversationHandler.END
 
 async def conv_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -400,31 +416,53 @@ async def show_today(bot_or_update, ctx=None, chat_id=None):
 
     if not lessons:
         text = f"📅 Сегодня ({now_local().strftime('%d.%m')}) занятий нет."
-    else:
-        text = f"📅 *Занятия сегодня, {now_local().strftime('%d.%m.%Y')}:*\n\n"
-        for l in lessons:
-            text += f"🕐 {l['time']} — *{l['student']}*\n"
-            if l.get("zoom"): text += f"   🔗 [Zoom]({l['zoom']})\n"
-            text += "\n"
-        text += f"🖥 [Открыть платформу]({PLATFORM_URL})"
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("📆 Неделя", callback_data="show_week"),
+            InlineKeyboardButton("➕ Занятие", callback_data="cb_addlesson")
+        ]])
+        if is_cb:
+            await bot_or_update.callback_query.edit_message_text(text, reply_markup=kb)
+        elif is_cmd:
+            await bot_or_update.message.reply_text(text, reply_markup=kb)
+        else:
+            await bot_or_update.send_message(chat_id or ADMIN_ID, text, reply_markup=kb)
+        return
 
-    kb = InlineKeyboardMarkup([[
+    # Заголовок
+    header = f"📅 *Занятия сегодня, {now_local().strftime('%d.%m.%Y')}:*"
+    top_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("📆 Неделя", callback_data="show_week"),
-        InlineKeyboardButton("➕ Занятие", callback_data="cb_addlesson")
+        InlineKeyboardButton("✅ Провёл", callback_data="done_pick")
     ]])
     if is_cb:
         await bot_or_update.callback_query.edit_message_text(
-            text, parse_mode="Markdown", reply_markup=kb,
-            disable_web_page_preview=True)
+            header, parse_mode="Markdown", reply_markup=top_kb)
+        send_fn = bot_or_update.callback_query.get_bot().send_message
+        cid = bot_or_update.callback_query.message.chat_id
     elif is_cmd:
         await bot_or_update.message.reply_text(
-            text, parse_mode="Markdown", reply_markup=kb,
-            disable_web_page_preview=True)
+            header, parse_mode="Markdown", reply_markup=top_kb)
+        send_fn = bot_or_update.message.reply_text
+        cid = None
     else:
-        # Вызов из планировщика
         await bot_or_update.send_message(
-            chat_id or ADMIN_ID, text, parse_mode="Markdown",
-            reply_markup=kb, disable_web_page_preview=True)
+            chat_id or ADMIN_ID, header, parse_mode="Markdown", reply_markup=top_kb)
+        send_fn = bot_or_update.send_message
+        cid = chat_id or ADMIN_ID
+
+    # Карточка на каждое занятие
+    for l in lessons:
+        card = f"🕐 *{l['time']}* — {l['student']}"
+        if l.get("zoom"): card += f"\n🔗 [Zoom]({l['zoom']})"
+        card_kb = admin_lesson_kb(l["id"])
+        try:
+            if cid:
+                await send_fn(cid, card, parse_mode="Markdown",
+                    reply_markup=card_kb, disable_web_page_preview=True)
+            else:
+                await send_fn(card, parse_mode="Markdown",
+                    reply_markup=card_kb, disable_web_page_preview=True)
+        except: pass
 
 async def cmd_today(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
@@ -449,7 +487,7 @@ async def show_week_fn(update: Update, ctx: ContextTypes.DEFAULT_TYPE, edit=Fals
                 text += f"*{fmt_date(d)}*\n"; cur = d
             text += f"  🕐 {l['time']} — {l['student']}"
             if l.get("zoom"): text += f" · [Zoom]({l['zoom']})"
-            text += f"\n  `/cancel_{l['id']}` · `/move_{l['id']}`\n"
+            text += "\n"
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("📅 Сегодня", callback_data="show_today"),
         InlineKeyboardButton("➕ Занятие", callback_data="cb_addlesson")
@@ -858,6 +896,11 @@ async def student_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lessons = get_lessons()
     lesson = next((l for l in lessons if l["id"]==lid), None)
     if not lesson: return
+
+    # Помечаем занятие как "ожидает решения" — напоминания прекращаются
+    lesson["status"] = "pending_cancel"
+    save_lessons(lessons)
+
     # Уведомляем репетитора
     try:
         await ctx.bot.send_message(ADMIN_ID,
@@ -865,15 +908,53 @@ async def student_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"👤 *{name}* хочет *{action}* занятие:\n"
             f"📅 {fmt_date(lesson['date'])} · 🕐 {lesson['time']}\n\n"
             f"Свяжись с учеником в Telegram.",
-            parse_mode="Markdown")
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Подтвердить отмену", callback_data=f"cancel_{lid}"),
+                InlineKeyboardButton("🔄 Перенести", callback_data=f"admin_move_{lid}")
+            ]]))
     except: pass
     await q.edit_message_text(
         f"✅ Уведомление отправлено репетитору!\n\n"
-        f"Илья свяжется с тобой по возможности переноса:\n"
+        f"Напоминания об этом занятии приостановлены.\n"
+        f"Илья свяжется с тобой:\n"
         f"📱 Telegram: {TUTOR_TG}\n"
         f"📞 Телефон: {TUTOR_PHONE}")
 
 # ── ПЛАНИРОВЩИК ───────────────────────────────────────────────────────────────
+# ── ГЛАВНОЕ МЕНЮ РЕПЕТИТОРА (постоянные кнопки) ──────────────────────────────
+from telegram import ReplyKeyboardMarkup, KeyboardButton
+
+ADMIN_REPLY_KB = ReplyKeyboardMarkup([
+    ["📅 Сегодня",        "📆 Неделя"],
+    ["➕ Добавить занятие", "✅ Провёл занятие"],
+    ["📚 Напомнить о ДЗ", "👥 Ученики"],
+], resize_keyboard=True, persistent=True)
+
+async def send_admin_main_menu(bot, text="Выбери действие:"):
+    """Отправляет сообщение с постоянной клавиатурой репетитору"""
+    try:
+        await bot.send_message(ADMIN_ID, text,
+            reply_markup=ADMIN_REPLY_KB)
+    except: pass
+
+async def handle_reply_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает нажатия на кнопки постоянной клавиатуры"""
+    if not is_admin(update): return
+    text = update.message.text
+    if text == "📅 Сегодня":
+        await cmd_today(update, ctx)
+    elif text == "📆 Неделя":
+        await cmd_week(update, ctx)
+    elif text == "➕ Добавить занятие":
+        return await cmd_addlesson(update, ctx)
+    elif text == "✅ Провёл занятие":
+        await cmd_done(update, ctx)
+    elif text == "📚 Напомнить о ДЗ":
+        await cmd_homework(update, ctx)
+    elif text == "👥 Ученики":
+        await cmd_students(update, ctx)
+
 async def morning_summary(bot):
     today = today_iso()
     lessons = [l for l in get_lessons()
@@ -913,9 +994,16 @@ async def morning_summary(bot):
                 disable_web_page_preview=True)
         except: pass
 
-async def send_reminders(bot):
+async def send_reminders(bot, sent_set: set):
+    """
+    sent_set — множество ключей уже отправленных напоминаний.
+    Формат ключа: "lesson_id:type" где type = "4h" или "15m"
+    Это предотвращает дублирование при повторных вызовах в ту же минуту.
+    """
     now = now_local()
-    lessons = [l for l in get_lessons() if l.get("status","active")=="active"]
+    # Пропускаем занятия со статусом cancelled, done, pending_cancel
+    active_statuses = {"active"}
+    lessons = [l for l in get_lessons() if l.get("status","active") in active_statuses]
     students = get_students()
     for lesson in lessons:
         ldt = lesson_datetime(lesson)
@@ -923,12 +1011,14 @@ async def send_reminders(bot):
         diff = (ldt - now).total_seconds() / 60
         student = lesson.get("student","")
         st = students.get(student, {})
-        subj_str = ""  # предмет не хранится отдельно — только студент
         time_str = lesson.get("time","")
         zoom = lesson.get("zoom","")
+        lid = lesson["id"]
 
-        # За 4 часа (±2 мин) — только ученику, Илье не нужно
-        if 238 <= diff <= 242:
+        # За 4 часа — только ученику
+        key_4h = f"{lid}:4h"
+        if 238 <= diff <= 242 and key_4h not in sent_set:
+            sent_set.add(key_4h)
             if st.get("tg_id"):
                 try:
                     msg = (f"Привет, {student.split()[0]}! 👋\n\n"
@@ -940,15 +1030,17 @@ async def send_reminders(bot):
                         InlineKeyboardButton("📅 Мои занятия", callback_data="my_lessons"),
                         InlineKeyboardButton("🖥 Платформа", url=PLATFORM_URL)
                     ], [
-                        InlineKeyboardButton("🔄 Хочу перенести", callback_data=f"student_move_{lesson['id']}"),
-                        InlineKeyboardButton("❌ Хочу отменить", callback_data=f"student_cancel_{lesson['id']}")
+                        InlineKeyboardButton("🔄 Хочу перенести", callback_data=f"student_move_{lid}"),
+                        InlineKeyboardButton("❌ Хочу отменить", callback_data=f"student_cancel_{lid}")
                     ]])
                     await bot.send_message(st["tg_id"], msg, parse_mode="Markdown",
                         reply_markup=kb, disable_web_page_preview=True)
                 except: pass
 
-        # За 15 минут (±2 мин)
-        if 13 <= diff <= 17:
+        # За 15 минут — обоим
+        key_15m = f"{lid}:15m"
+        if 13 <= diff <= 17 and key_15m not in sent_set:
+            sent_set.add(key_15m)
             # Репетитору
             try:
                 msg = (f"🔔 Через 15 минут — *{student}*!\n\n"
@@ -956,7 +1048,7 @@ async def send_reminders(bot):
                 if zoom: msg += f"\n🔗 [Войти в Zoom]({zoom})"
                 msg += f"\n🖥 [Открыть платформу]({PLATFORM_URL})"
                 await bot.send_message(ADMIN_ID, msg, parse_mode="Markdown",
-                    reply_markup=admin_lesson_kb(lesson["id"]),
+                    reply_markup=admin_lesson_kb(lid),
                     disable_web_page_preview=True)
             except: pass
             # Ученику
@@ -1027,15 +1119,22 @@ async def check_recurring_expiry(bot):
             except: pass
 async def scheduler(bot):
     sent_morning = None
-    sent_expiry = None
+    sent_reminders = set()  # ключи уже отправленных напоминаний
+    last_reset_day = None
     while True:
         now = now_local()
         day_key = now.strftime("%Y-%m-%d")
+        # Сбрасываем множество отправленных в начале каждого дня
+        if day_key != last_reset_day:
+            sent_reminders = set()
+            last_reset_day = day_key
+        # Утренняя сводка в REMIND_HOUR:00
         if now.hour == REMIND_HOUR and now.minute == 0 and sent_morning != day_key:
             sent_morning = day_key
             await morning_summary(bot)
             await check_recurring_expiry(bot)
-        await send_reminders(bot)
+        # Напоминания о занятиях (с дедупликацией)
+        await send_reminders(bot, sent_reminders)
         await asyncio.sleep(60)
 
 # ── ЗАПУСК ────────────────────────────────────────────────────────────────────
@@ -1087,6 +1186,11 @@ def main():
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("students", cmd_students))
     app.add_handler(CommandHandler("removestudent", cmd_removestudent))
+    # Кнопки постоянной клавиатуры репетитора
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(
+            r"^(📅 Сегодня|📆 Неделя|➕ Добавить занятие|✅ Провёл занятие|📚 Напомнить о ДЗ|👥 Ученики)$"),
+        handle_reply_kb), group=0)
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(r"^/(cancel|move)_\d+"),
         handle_lesson_command))
@@ -1095,27 +1199,37 @@ def main():
 
     async def post_init(application):
         asyncio.create_task(scheduler(application.bot))
-        # Устанавливаем команды меню для репетитора
-        from telegram import BotCommand, BotCommandScopeChat
+        from telegram import BotCommand, BotCommandScopeChat, BotCommandScopeDefault
         admin_commands = [
-            BotCommand("start",      "🏠 Главное меню"),
-            BotCommand("today",      "📅 Занятия сегодня"),
-            BotCommand("week",       "📆 Расписание на неделю"),
-            BotCommand("addlesson",  "➕ Добавить занятие"),
-            BotCommand("done",       "✅ Провёл занятие"),
-            BotCommand("homework",   "📚 Напомнить о ДЗ"),
-            BotCommand("addstudent", "👤 Добавить ученика"),
-            BotCommand("students",     "👥 Список учеников"),
+            BotCommand("today",         "📅 Занятия сегодня"),
+            BotCommand("week",          "📆 Расписание на неделю"),
+            BotCommand("addlesson",     "➕ Добавить занятие"),
+            BotCommand("done",          "✅ Провёл занятие"),
+            BotCommand("homework",      "📚 Напомнить о ДЗ"),
+            BotCommand("addstudent",    "👤 Добавить ученика"),
+            BotCommand("students",      "👥 Список учеников"),
             BotCommand("removestudent", "🗑 Удалить ученика"),
-            BotCommand("cancel",       "❌ Отмена диалога"),
+            BotCommand("cancel",        "❌ Отмена"),
+        ]
+        student_commands = [
+            BotCommand("start",    "🏠 Главное меню"),
+            BotCommand("platform", "🖥 Открыть платформу"),
         ]
         try:
             await application.bot.set_my_commands(
                 admin_commands,
                 scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+            await application.bot.set_my_commands(
+                student_commands,
+                scope=BotCommandScopeDefault())
         except Exception as e:
             print(f"Меню команд: {e}")
+        try:
+            await send_admin_main_menu(application.bot)
+        except Exception as e:
+            print(f"Главное меню: {e}")
         print("✅ Бот-напоминалкин запущен!")
+
 
     app.post_init = post_init
     print("🚀 Запускаю бота...")
