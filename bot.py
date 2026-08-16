@@ -939,15 +939,13 @@ async def send_admin_main_menu(bot, text="Выбери действие:"):
     except: pass
 
 async def handle_reply_kb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обрабатывает нажатия на кнопки постоянной клавиатуры"""
+    """Обрабатывает нажатия на кнопки постоянной клавиатуры (кроме ➕ — он в ConvHandler)"""
     if not is_admin(update): return
     text = update.message.text
     if text == "📅 Сегодня":
         await cmd_today(update, ctx)
     elif text == "📆 Неделя":
         await cmd_week(update, ctx)
-    elif text == "➕ Добавить занятие":
-        return await cmd_addlesson(update, ctx)
     elif text == "✅ Провёл занятие":
         await cmd_done(update, ctx)
     elif text == "📚 Напомнить о ДЗ":
@@ -1156,6 +1154,7 @@ def main():
         entry_points=[
             CommandHandler("addlesson", cmd_addlesson),
             CallbackQueryHandler(cmd_addlesson, pattern="^cb_addlesson$"),
+            MessageHandler(filters.TEXT & filters.Regex(r"^➕ Добавить занятие$"), cmd_addlesson),
         ],
         states={
             ADD_LESSON_STUDENT:   [CallbackQueryHandler(got_lesson_student, pattern="^ls_")],
@@ -1189,7 +1188,7 @@ def main():
     # Кнопки постоянной клавиатуры репетитора
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(
-            r"^(📅 Сегодня|📆 Неделя|➕ Добавить занятие|✅ Провёл занятие|📚 Напомнить о ДЗ|👥 Ученики)$"),
+            r"^(📅 Сегодня|📆 Неделя|✅ Провёл занятие|📚 Напомнить о ДЗ|👥 Ученики)$"),
         handle_reply_kb), group=0)
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(r"^/(cancel|move)_\d+"),
