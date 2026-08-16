@@ -12,7 +12,8 @@ from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
 BOT_TOKEN    = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН")
 ADMIN_ID     = int(os.getenv("ADMIN_ID", "0"))
 TZ_OFFSET    = int(os.getenv("TZ_OFFSET", "3"))
-PLATFORM_URL = os.getenv("PLATFORM_URL", "https://web-production-aa92f.up.railway.app")
+PLATFORM_URL       = os.getenv("PLATFORM_URL", "https://web-production-aa92f.up.railway.app")
+ADMIN_PLATFORM_URL = PLATFORM_URL + "/admin"  # ссылка для репетитора
 REMIND_HOUR  = int(os.getenv("REMIND_HOUR", "9"))
 TUTOR_TG     = "@grandvillakotel"
 TUTOR_PHONE  = "+7 906 585 7200"
@@ -630,6 +631,148 @@ async def hw_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(f"✅ Отправлено {sent} ученик(ам).")
 
 # ── ОТМЕТИТЬ ЗАНЯТИЕ КАК ПРОВЕДЁННОЕ ─────────────────────────────────────────
+# ── ОТМЕНА / ПЕРЕНОС / РЕДАКТИРОВАНИЕ (выбор из ближайших 4) ────────────────
+
+def get_upcoming_lessons(n=4):
+    """Возвращает n ближайших активных занятий по дате"""
+    today = now_local().date()
+    lessons = [l for l in get_lessons()
+               if l.get("status", "active") in {"active", "planned"}
+               and (d := parse_date(l.get("date", ""))) and d >= today]
+    lessons.sort(key=lambda l: (l.get("date", ""), l.get("time", "")))
+    return lessons[:n]
+
+async def cmd_cancel_lesson(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Отменить занятие — показывает ближайшие 4"""
+    if not is_admin(update): return
+    lessons = get_upcoming_lessons(4)
+    if not lessons:
+        await update.message.reply_text("Ближайших занятий нет.")
+        return
+    kb = [[InlineKeyboardButton(
+        f"❌ {fmt_date(l['date'])} {l['time']} — {l['student']}",
+        callback_data=f"cancel_{l['id']}")]
+        for l in lessons]
+    await update.message.reply_text(
+        "Какое занятие отменить?",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+async def cmd_move_lesson(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Перенести занятие — показывает ближайшие 4"""
+    if not is_admin(update): return
+    lessons = get_upcoming_lessons(4)
+    if not lessons:
+        await update.message.reply_text("Ближайших занятий нет.")
+        return
+    kb = [[InlineKeyboardButton(
+        f"🔄 {fmt_date(l['date'])} {l['time']} — {l['student']}",
+        callback_data=f"admin_move_{l['id']}")]
+        for l in lessons]
+    await update.message.reply_text(
+        "Какое занятие перенести?",
+        reply_markup=InlineKeyboardMarkup(kb))
+
+# Состояния для редактирования занятия
+EDIT_LESSON_PICK, EDIT_LESSON_FIELD, EDIT_LESSON_VALUE = 20, 21, 22
+
+async def cmd_edit_lesson(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Изменить занятие — показывает ближайшие 4"""
+    if not is_admin(update): return
+    lessons = get_upcoming_lessons(4)
+    if not lessons:
+        await update.message.reply_text("Ближайших занятий нет.")
+        return
+    kb = [[InlineKeyboardButton(
+        f"✏️ {fmt_date(l['date'])} {l['time']} — {l['student']}",
+        callback_data=f"edit_pick_{l['id']}")]
+        for l in lessons]
+    await update.message.reply_text(
+        "Какое занятие изменить?",
+        reply_markup=InlineKeyboardMarkup(kb))
+    return EDIT_LESSON_PICK
+
+async def edit_pick_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    lid = int(q.data.replace("edit_pick_", ""))
+    lesson = next((l for l in get_lessons() if l["id"] == lid), None)
+    if not lesson:
+        await q.edit_message_text("Занятие не найдено."); return ConversationHandler.END
+    ctx.user_data["edit_lid"] = lid
+    ctx.user_data["edit_lesson"] = lesson
+    kb = [[InlineKeyboardButton("📅 Дата", callback_data="edit_field_date"),
+           InlineKeyboardButton("🕐 Время", callback_data="edit_field_time")],
+          [InlineKeyboardButton("🔗 Zoom-ссылка", callback_data="edit_field_zoom"),
+           InlineKeyboardButton("❌ Отмена", callback_data="cancel_conv")]]
+    await q.edit_message_text(
+        f"✏️ Занятие: *{lesson['student']}*\n"
+        f"📅 {fmt_date(lesson['date'])} · 🕐 {lesson['time']}\n\n"
+        "Что изменить?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb))
+    return EDIT_LESSON_FIELD
+
+async def edit_field_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    field = q.data.replace("edit_field_", "")
+    ctx.user_data["edit_field"] = field
+    prompts = {
+        "date": "Введи новую дату (пример: `25.08` или `25 августа`):",
+        "time": "Введи новое время (пример: `16:00`):",
+        "zoom": "Введи новую ссылку на Zoom (или `-` чтобы убрать):"
+    }
+    await q.edit_message_text(prompts.get(field, "Введи значение:"), parse_mode="Markdown")
+    return EDIT_LESSON_VALUE
+
+async def edit_value_msg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    field = ctx.user_data.get("edit_field")
+    lid = ctx.user_data.get("edit_lid")
+    text = update.message.text.strip()
+    lessons = get_lessons()
+    lesson = next((l for l in lessons if l["id"] == lid), None)
+    if not lesson:
+        await update.message.reply_text("Занятие не найдено.")
+        return ConversationHandler.END
+
+    if field == "date":
+        d = parse_date(text)
+        if not d:
+            await update.message.reply_text(
+                "Не понял дату. Попробуй: `25.08`", parse_mode="Markdown")
+            return EDIT_LESSON_VALUE
+        lesson["date"] = d.isoformat()
+    elif field == "time":
+        h, mi = parse_time(text)
+        if h is None:
+            await update.message.reply_text(
+                "Не понял время. Попробуй: `16:00`", parse_mode="Markdown")
+            return EDIT_LESSON_VALUE
+        lesson["time"] = f"{h:02d}:{mi:02d}"
+    elif field == "zoom":
+        lesson["zoom"] = "" if text == "-" else text
+
+    save_lessons(lessons)
+    # Уведомляем ученика если дата или время изменились
+    if field in ("date", "time"):
+        students = get_students()
+        st = students.get(lesson.get("student", ""), {})
+        if st.get("tg_id"):
+            try:
+                await ctx.bot.send_message(st["tg_id"],
+                    "📅 Занятие обновлено!\n\n"
+                    f"{lesson['student'].split()[0]}, репетитор изменил расписание:\n"
+                    f"📅 {fmt_date(lesson['date'])} · 🕐 {lesson['time']}\n\n"
+                    f"Если есть вопросы — свяжись с Ильёй:\n"
+                    f"📱 {TUTOR_TG} · 📞 {TUTOR_PHONE}",
+                    parse_mode="Markdown")
+
+            except: pass
+    await update.message.reply_text(
+        "✅ Занятие обновлено!\n"
+        f"👤 {lesson['student']}\n"
+        f"📅 {fmt_date(lesson['date'])} · 🕐 {lesson['time']}",
+        reply_markup=ADMIN_REPLY_KB)
+    return ConversationHandler.END
+
 async def cmd_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update): return
     today = today_iso()
@@ -796,6 +939,12 @@ async def callback_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await hw_callback(update, ctx)
         return
     # Продлить повторяющееся расписание на 4 недели
+    if data.startswith("edit_pick_"):
+        await edit_pick_cb(update, ctx)
+        return
+    if data.startswith("edit_field_"):
+        await edit_field_cb(update, ctx)
+        return
     if data.startswith("extend_"):
         await q.answer()
         parts = data.split("_", 4)  # extend_ИМЯ_ВРЕМЯ_ZOOM_ДАТА
@@ -1042,9 +1191,9 @@ async def send_reminders(bot, sent_set: set):
             # Репетитору
             try:
                 msg = (f"🔔 Через 15 минут — *{student}*!\n\n"
-                       f"🕐 {time_str}")
-                if zoom: msg += f"\n🔗 [Войти в Zoom]({zoom})"
-                msg += f"\n🖥 [Открыть платформу]({PLATFORM_URL})"
+                       f"🕐 {time_str}\n"
+                       f"🖥 [Открыть платформу]({ADMIN_PLATFORM_URL})\n"
+                       f"_Не забудь проверить ссылку Zoom на платформе_")
                 await bot.send_message(ADMIN_ID, msg, parse_mode="Markdown",
                     reply_markup=admin_lesson_kb(lid),
                     disable_web_page_preview=True)
@@ -1176,8 +1325,26 @@ def main():
         ],
         allow_reentry=True)
 
+    # Диалог: редактировать занятие
+    edit_lesson_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("editlesson", cmd_edit_lesson),
+            MessageHandler(filters.TEXT & filters.Regex(r"^✏️ Изменить занятие$"), cmd_edit_lesson),
+        ],
+        states={
+            EDIT_LESSON_PICK:  [CallbackQueryHandler(edit_pick_cb, pattern="^edit_pick_")],
+            EDIT_LESSON_FIELD: [CallbackQueryHandler(edit_field_cb, pattern="^edit_field_")],
+            EDIT_LESSON_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_value_msg)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", conv_cancel),
+            CallbackQueryHandler(conv_cancel, pattern="^cancel_conv$"),
+        ],
+        allow_reentry=True)
+
     app.add_handler(add_student_conv)
     app.add_handler(add_lesson_conv)
+    app.add_handler(edit_lesson_conv)
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
@@ -1185,6 +1352,9 @@ def main():
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("students", cmd_students))
     app.add_handler(CommandHandler("removestudent", cmd_removestudent))
+    app.add_handler(CommandHandler("cancelesson", cmd_cancel_lesson))
+    app.add_handler(CommandHandler("movelesson", cmd_move_lesson))
+    app.add_handler(CommandHandler("editlesson", cmd_edit_lesson))
     # Кнопки постоянной клавиатуры репетитора
     app.add_handler(MessageHandler(
         filters.TEXT & filters.Regex(
@@ -1208,7 +1378,10 @@ def main():
             BotCommand("addstudent",    "👤 Добавить ученика"),
             BotCommand("students",      "👥 Список учеников"),
             BotCommand("removestudent", "🗑 Удалить ученика"),
-            BotCommand("cancel",        "❌ Отмена"),
+            BotCommand("cancelesson",   "❌ Отменить занятие"),
+            BotCommand("movelesson",    "🔄 Перенести занятие"),
+            BotCommand("editlesson",    "✏️ Изменить занятие"),
+            BotCommand("cancel",        "❌ Отмена диалога"),
         ]
         student_commands = [
             BotCommand("start",    "🏠 Главное меню"),
